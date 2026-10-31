@@ -1,0 +1,21 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Working files (audio, raw transcripts). Only data/state.json is committed.
+data/*
+!data/state.json
+
+# Mailing list for local runs only. On GitHub the list lives in the EMAIL_TO secret.
+recipients.txt
+
+# Local notes and plans stay out of the repo (README.md is the only committed Markdown).
+/*.md
+!/README.md
+
+# Local-only helpers
+.env.example
+run_local.ps1

@@ -1,0 +1,103 @@
+name: Transcribe new All-In episodes
+
+on:
+  schedule:
+    # Every hour at :17. A check with nothing new takes about a minute.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        options: [run, test-email, check]
+        default: run
+      episode:
+        description: "Optional: 'latest', a GUID, or part of a title"
+        required: false
+        default: ""
+      force:
+        description: "Redo even if already emailed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # to commit data/state.json
+
+concurrency:
+  group: transcribe
+  cancel-in-progress: false
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Scheduled runs first ask the feed (stdlib only) whether anything is new, so the
+      # multi-GB install below only happens when there is an episode to transcribe.
+      - name: Check for new episodes
+        id: pending
+        if: ${{ github.event_name == 'schedule' }}
+        run: python -m podcast_transcriber pending
+
+      # Heavy ML install: manual `run`, or a scheduled run that found a new episode.
+      # Quick modes (test-email, check) skip it.
+      - name: Install ffmpeg
+        if: ${{ inputs.mode == 'run' || steps.pending.outputs.new == 'true' }}
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Install Python deps (CPU torch)
+        if: ${{ inputs.mode == 'run' || steps.pending.outputs.new == 'true' }}
+        run: pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Cache models
+        if: ${{ inputs.mode == 'run' || steps.pending.outputs.new == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-v1
+
+      - name: Run pipeline
+        # Any manual mode, or a scheduled run with something new.
+        if: ${{ inputs.mode || steps.pending.outputs.new == 'true' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          # Secrets, not variables: the repo is public and variable values are printed in run logs.
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          # Recipients, comma-separated
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          # Optional SMTP fallback (used only if RESEND_API_KEY is empty)
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'large-v3-turbo' }}
+          MODE: ${{ inputs.mode || 'run' }}
+          EPISODE: ${{ inputs.episode }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          if [ "$MODE" != "run" ]; then python -m podcast_transcriber "$MODE"; exit $?; fi
+          set -- run
+          if [ -n "$EPISODE" ]; then set -- "$@" --episode "$EPISODE"; fi
+          if [ "$FORCE" = "true" ]; then set -- "$@" --force; fi
+          python -m podcast_transcriber "$@"
+
+      # No transcript artifacts: on a public repo anyone could download them.
+
+      - name: Commit state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f data/state.json || exit 0
+          git diff --cached --quiet && exit 0
+          git commit -m "Update processed-episode state"
+          # A recipients PR may have been merged while this job ran.
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push
