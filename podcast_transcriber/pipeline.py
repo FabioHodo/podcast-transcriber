@@ -1,4 +1,4 @@
-"""Orchestrate: feed -> new episodes -> audio -> transcript -> names -> email.
+"""Orchestrate: feed -> new episodes -> audio -> transcript -> names -> takeaways -> email.
 
 Every stage writes its output into data/episodes/<slug>/ and is skipped on rerun
 if that output already exists, so a failed email never forces a re-transcription.
@@ -10,7 +10,7 @@ import json
 import logging
 from pathlib import Path
 
-from . import emailer, render, speakers, transcribe
+from . import emailer, render, speakers, summary, transcribe
 from .config import Config
 from .feed import Episode, fetch_episodes, resolve_feed_url
 from .recipients import mask
@@ -50,6 +50,7 @@ def process_episode(ep: Episode, cfg: Config, send_email: bool = True) -> Path:
     raw_path = work / "raw_whisperx.json"
     turns_path = work / "turns.json"
     names_path = work / "speakers.json"
+    summary_path = work / "summary.json"
     transcript_path = work / f"{ep.slug}.txt"
     audio_path = work / "audio.mp3"
 
@@ -76,13 +77,26 @@ def process_episode(ep: Episode, cfg: Config, send_email: bool = True) -> Path:
         names_path.write_text(json.dumps(speaker_info, indent=2))
     named: list[Turn] = apply_names(turns, speaker_info.get("mapping") or {})
 
-    # 4) Render
-    transcript_path.write_text(render.transcript_text(ep, named), encoding="utf-8")
+    # 4) Key takeaways. Optional: a failure here must not hold back the transcript email.
+    if summary_path.exists():
+        takeaways = json.loads(summary_path.read_text())["takeaways"]
+    else:
+        try:
+            info = summary.summarize(ep, named, cfg)
+            takeaways = info["takeaways"]
+            if info["model"]:  # don't cache "no API key", so adding a key later takes effect
+                summary_path.write_text(json.dumps(info, indent=2))
+        except Exception:
+            log.exception("Key takeaways failed; sending the transcript without them")
+            takeaways = []
+
+    # 5) Render
+    transcript_path.write_text(render.transcript_text(ep, named, takeaways), encoding="utf-8")
     log.info("Transcript written: %s (%d turns)", transcript_path, len(named))
 
-    # 5) Email
+    # 6) Email
     if send_email:
-        plain, html = render.email_bodies(ep, named, speaker_info)
+        plain, html = render.email_bodies(ep, named, speaker_info, takeaways)
         deliver(cfg, work, render.email_subject(ep), plain, html, transcript_path)
     return transcript_path
 

@@ -68,6 +68,7 @@ class Config:
     # Speaker mapping
     anthropic_api_key: str | None = None
     claude_model: str = "claude-haiku-5-5"
+    summary_model: str = "claude-opus-5-5"  # key takeaways; quality matters more than for naming
 
     # Email: Resend (preferred) or SMTP
     resend_api_key: str | None = None
@@ -112,6 +113,7 @@ class Config:
             max_speakers=_env_int("MAX_SPEAKERS", 8),
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             claude_model=_env("CLAUDE_MODEL", "claude-haiku-5-5"),
+            summary_model=_env("SUMMARY_MODEL", "claude-opus-5-5"),
             resend_api_key=_env("RESEND_API_KEY"),
             smtp_host=_env("SMTP_HOST", "smtp.gmail.com"),
             smtp_port=_env_int("SMTP_PORT", 587),

@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from podcast_transcriber import pipeline, render, speakers
+from types import SimpleNamespace
+
+from podcast_transcriber import pipeline, render, speakers, summary
 from podcast_transcriber.config import Config
 from podcast_transcriber import emailer
 from podcast_transcriber.emailer import build_message
@@ -162,6 +164,85 @@ def test_process_episode_uses_cache_and_no_api_key(tmp_path, monkeypatch):
     text = out.read_text(encoding="utf-8")
     assert "Speaker 1: Welcome back Chamath." in text
     assert json.loads((work / "speakers.json").read_text())["mapping"] == {}
+    assert "KEY TAKEAWAYS" not in text
+    assert not (work / "summary.json").exists()  # "no key" isn't cached; adding a key later works
+
+
+TAKEAWAYS = [
+    {"speaker": "Jason Calacanis", "timestamp": "00:00:00", "point": "Chamath is back on the show."},
+    {"speaker": "Chamath Palihapitiya", "timestamp": "00:00:01", "point": "It is great to be here in 2026."},
+]
+
+
+def test_parse_takeaways_validates_and_caps():
+    items = [{"speaker": "Jason Calacanis", "timestamp": "00:01:02", "point": "A real point."},
+             {"speaker": "Made Up Person", "timestamp": "1:02", "point": "Unknown speaker, bad time."},
+             {"speaker": "Jason Calacanis", "timestamp": "00:03:00", "point": "  "}]
+    items += [{"speaker": "Jason Calacanis", "timestamp": "00:04:00", "point": f"p{i}"} for i in range(30)]
+    out = summary.parse_takeaways(json.dumps({"takeaways": items}), {"Jason Calacanis"})
+    assert out[0] == {"speaker": "Jason Calacanis", "timestamp": "00:01:02", "point": "A real point."}
+    assert out[1] == {"speaker": "", "timestamp": "", "point": "Unknown speaker, bad time."}
+    assert len(out) == summary.MAX_TAKEAWAYS and all(t["point"].strip() for t in out)
+
+
+class FakeClient:
+    """Stands in for anthropic.Anthropic: records the request, returns a canned reply."""
+
+    def __init__(self, text="", stop_reason="end_turn"):
+        self.kwargs = None
+        reply = SimpleNamespace(
+            stop_reason=stop_reason, stop_details=None, model="claude-opus-5-5",
+            content=[SimpleNamespace(type="thinking", thinking=""), SimpleNamespace(type="text", text=text)],
+        )
+        create = lambda **kw: (setattr(self, "kwargs", kw), reply)[1]  # noqa: E731
+        self.beta = SimpleNamespace(messages=SimpleNamespace(create=create))
+
+
+def test_summarize_request_and_reply(tmp_path):
+    ep = parse_feed(FEED)[0]
+    named = apply_names(build_turns(SEGMENTS), {"SPEAKER_00": "Jason Calacanis", "SPEAKER_01": "Chamath Palihapitiya"})
+    client = FakeClient(json.dumps({"takeaways": TAKEAWAYS}))
+    info = summary.summarize(ep, named, make_cfg(tmp_path, anthropic_api_key="k"), client=client)
+    assert info == {"takeaways": TAKEAWAYS, "model": "claude-opus-5-5"}
+    kw = client.kwargs
+    assert kw["model"] == "claude-opus-5-5" and kw["fallbacks"] == "default"
+    assert kw["output_config"]["format"]["type"] == "json_schema"
+    assert "[00:00:01] Chamath Palihapitiya: Thanks" in kw["messages"][0]["content"]
+    with pytest.raises(RuntimeError, match="declined"):
+        summary.summarize(ep, named, make_cfg(tmp_path, anthropic_api_key="k"), client=FakeClient(stop_reason="refusal"))
+
+
+def test_render_includes_takeaways(tmp_path):
+    ep = parse_feed(FEED)[0]
+    named = apply_names(build_turns(SEGMENTS), {"SPEAKER_00": "Jason Calacanis", "SPEAKER_01": "Chamath Palihapitiya"})
+    text = render.transcript_text(ep, named, TAKEAWAYS)
+    assert "- [00:00:01] Chamath Palihapitiya: It is great to be here in 2026." in text
+    assert text.index("KEY TAKEAWAYS") < text.index("[00:00:00] Jason Calacanis: Welcome back")
+    plain, html = render.email_bodies(ep, named, {}, TAKEAWAYS)
+    assert "  - [00:00:00] Jason Calacanis: Chamath is back on the show." in plain
+    assert plain.index("Key takeaways:") < plain.index("Who talked:")
+    assert "<strong>Chamath Palihapitiya:</strong> It is great to be here in 2026.</li>" in html
+
+
+def test_takeaways_failure_still_sends_transcript_and_cache_is_used(tmp_path, monkeypatch):
+    ep = parse_feed(FEED)[0]
+    cfg = make_cfg(tmp_path, anthropic_api_key=None)
+    work = cfg.episodes_dir / ep.slug
+    work.mkdir(parents=True)
+    (work / "raw_whisperx.json").write_text(json.dumps({"segments": SEGMENTS}))
+    sent = []
+    monkeypatch.setattr(pipeline, "deliver", lambda c, w, subj, plain, html, att: sent.append(plain))
+
+    def boom(*a, **k):
+        raise RuntimeError("API down")
+
+    monkeypatch.setattr(summary, "summarize", boom)
+    pipeline.process_episode(ep, cfg, send_email=True)
+    assert len(sent) == 1 and "Key takeaways" not in sent[0]
+
+    (work / "summary.json").write_text(json.dumps({"takeaways": TAKEAWAYS, "model": "m"}))
+    pipeline.process_episode(ep, cfg, send_email=True)  # cached: summarize (still broken) isn't called
+    assert "Chamath is back on the show." in sent[1]
 
 
 def test_resend_payload_and_dispatch(tmp_path, monkeypatch):
