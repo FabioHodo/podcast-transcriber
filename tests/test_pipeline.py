@@ -375,3 +375,26 @@ def test_workflow_gates_heavy_install_on_pending_check():
     for step in ("Install ffmpeg", "Install Python deps", "Cache models", "Run pipeline"):
         block = wf.split(f"- name: {step}", 1)[1].split("- name:", 1)[0]
         assert gate in block, f"{step} is not gated on the pending check"
+
+
+def _step(wf: str, name: str) -> str:
+    return wf.split(f"- name: {name}", 1)[1].split("- name:", 1)[0]
+
+
+def test_workflow_auto_mode_behaves_like_the_schedule():
+    """The external hourly trigger dispatches mode=auto: cheap check first, transcribe only
+    when there's a new episode, and the pipeline itself runs as plain `run`."""
+    wf = (Path(__file__).resolve().parents[1] / ".github/workflows/transcribe.yml").read_text(encoding="utf-8")
+    assert "options: [run, auto, test-email, check]" in wf
+    assert "inputs.mode == 'auto'" in _step(wf, "Check for new episodes")
+    run_step = _step(wf, "Run pipeline")
+    assert "(inputs.mode && inputs.mode != 'auto') || steps.pending.outputs.new == 'true'" in run_step
+    assert "MODE: ${{ (!inputs.mode || inputs.mode == 'auto') && 'run' || inputs.mode }}" in run_step
+
+
+def test_workflow_checks_out_current_branch_not_trigger_commit():
+    """A run queued behind a long transcription must see the latest state.json, or it would
+    transcribe and email the same episode a second time."""
+    wf = (Path(__file__).resolve().parents[1] / ".github/workflows/transcribe.yml").read_text(encoding="utf-8")
+    checkout = wf.split("uses: actions/checkout@v4", 1)[1].split("- uses:", 1)[0]
+    assert "ref: ${{ github.event.repository.default_branch }}" in checkout

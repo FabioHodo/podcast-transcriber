@@ -2,14 +2,15 @@ name: Transcribe new All-In episodes
 
 on:
   schedule:
-    # Every hour at :17. A check with nothing new takes about a minute.
+    # Every hour at :17. A check with nothing new takes about a minute. GitHub often skips
+    # scheduled runs, so an external cron also dispatches this workflow hourly with mode=auto.
     - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "What to run"
+        description: "What to run (auto = same as the schedule: only transcribe if there's a new episode)"
         type: choice
-        options: [run, test-email, check]
+        options: [run, auto, test-email, check]
         default: run
       episode:
         description: "Optional: 'latest', a GUID, or part of a title"
@@ -32,18 +33,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      # Check out the branch as it is now, not the commit that triggered the run: a run that
+      # waited in the queue behind a long transcription would otherwise see a stale
+      # state.json and email the same episode again.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
 
-      # Scheduled runs first ask the feed (stdlib only) whether anything is new, so the
-      # multi-GB install below only happens when there is an episode to transcribe.
+      # Scheduled and `auto` runs first ask the feed (stdlib only) whether anything is new, so
+      # the multi-GB install below only happens when there is an episode to transcribe.
       - name: Check for new episodes
         id: pending
-        if: ${{ github.event_name == 'schedule' }}
+        if: ${{ github.event_name == 'schedule' || inputs.mode == 'auto' }}
         run: python -m podcast_transcriber pending
 
       # Heavy ML install: manual `run`, or a scheduled run that found a new episode.
@@ -64,8 +70,8 @@ jobs:
           key: hf-models-v1
 
       - name: Run pipeline
-        # Any manual mode, or a scheduled run with something new.
-        if: ${{ inputs.mode || steps.pending.outputs.new == 'true' }}
+        # Any manual mode except auto, or a scheduled/auto run with something new.
+        if: ${{ (inputs.mode && inputs.mode != 'auto') || steps.pending.outputs.new == 'true' }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -78,7 +84,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'large-v3-turbo' }}
-          MODE: ${{ inputs.mode || 'run' }}
+          MODE: ${{ (!inputs.mode || inputs.mode == 'auto') && 'run' || inputs.mode }}
           EPISODE: ${{ inputs.episode }}
           FORCE: ${{ inputs.force }}
         run: |
@@ -98,6 +104,6 @@ jobs:
           git add -f data/state.json || exit 0
           git diff --cached --quiet && exit 0
           git commit -m "Update processed-episode state"
-          # A recipients PR may have been merged while this job ran.
+          # Something else may have been pushed while this job ran.
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push
