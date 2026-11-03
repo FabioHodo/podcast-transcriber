@@ -169,8 +169,11 @@ def run(
         return 1
     log.info("Feed has %d episodes; newest: %s (%s)", len(episodes), episodes[0].title, episodes[0].date)
 
+    only = (only or "").strip()
     if only:
-        if only == "latest":
+        # Case-insensitive: "Latest" typed into the Actions form used to fall through to the
+        # title search and pick an old episode whose title says "latest".
+        if only.lower() == "latest":
             targets = episodes[:1]
         else:
             q = only.lower()

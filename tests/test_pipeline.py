@@ -135,6 +135,20 @@ def test_run_first_time_processes_only_latest_then_nothing(tmp_path, monkeypatch
     assert pipeline.run(cfg) == 0 and processed == ["g2"]
 
 
+@pytest.mark.parametrize("arg", ["latest", "Latest", " LATEST "])
+def test_run_latest_is_case_insensitive(tmp_path, monkeypatch, arg):
+    # An older title containing "latest" must not be picked by a title search.
+    feed = FEED.replace(b"Older episode", b"Older episode: DeepMind's latest breakthrough")
+    monkeypatch.setattr(pipeline, "fetch_episodes", lambda url: parse_feed(feed))
+    processed = []
+    monkeypatch.setattr(
+        pipeline, "process_episode", lambda ep, cfg, send_email=True: processed.append(ep.guid) or tmp_path / "x.txt"
+    )
+    cfg = make_cfg(tmp_path, email_to="me@example.com")
+    assert pipeline.run(cfg, only=arg, force=True) == 0
+    assert processed == ["g2"]
+
+
 def test_run_failure_is_retried_next_time(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "fetch_episodes", lambda url: parse_feed(FEED))
     calls = {"n": 0}
