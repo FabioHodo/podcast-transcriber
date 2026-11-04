@@ -40,10 +40,12 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
 
+      # No `cache: pip` here: on a quick check nothing is pip-installed, ~/.cache/pip never
+      # exists, and setup-python's post step then fails the whole run. The pip cache is
+      # restored below, only on runs that install the dependencies.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
 
       # Scheduled and `auto` runs first ask the feed (stdlib only) whether anything is new, so
       # the multi-GB install below only happens when there is an episode to transcribe.
@@ -57,6 +59,14 @@ jobs:
       - name: Install ffmpeg
         if: ${{ inputs.mode == 'run' || steps.pending.outputs.new == 'true' }}
         run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Cache pip downloads
+        if: ${{ inputs.mode == 'run' || steps.pending.outputs.new == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py3.11-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-${{ runner.os }}-py3.11-
 
       - name: Install Python deps (CPU torch)
         if: ${{ inputs.mode == 'run' || steps.pending.outputs.new == 'true' }}
