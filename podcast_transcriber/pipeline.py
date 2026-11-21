@@ -69,12 +69,17 @@ def process_episode(ep: Episode, cfg: Config, send_email: bool = True) -> Path:
     turns = build_turns(result["segments"])
     turns_path.write_text(json.dumps([t.to_dict() for t in turns], indent=1))
 
-    # 3) Speaker names
+    # 3) Speaker names. A failure here must not throw away hours of transcription: send the
+    # transcript with "Speaker N" labels instead (not cached, so a rerun tries naming again).
     if names_path.exists():
         speaker_info = json.loads(names_path.read_text())
     else:
-        speaker_info = speakers.map_speakers(ep, turns, cfg)
-        names_path.write_text(json.dumps(speaker_info, indent=2))
+        try:
+            speaker_info = speakers.map_speakers(ep, turns, cfg)
+            names_path.write_text(json.dumps(speaker_info, indent=2))
+        except Exception:
+            log.exception("Speaker naming failed; sending the transcript with unnamed speakers")
+            speaker_info = {"mapping": {}, "confidence": {}, "notes": "Speaker names unavailable.", "model": None}
     named: list[Turn] = apply_names(turns, speaker_info.get("mapping") or {})
 
     # 4) Key takeaways. Optional: a failure here must not hold back the transcript email.

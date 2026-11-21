@@ -85,10 +85,14 @@ def test_apply_names_merges_split_labels_and_falls_back():
 
 
 def test_parse_mapping_tolerates_fences_and_drops_unknowns():
-    reply = 'Sure:\n```json\n{"mapping": {"SPEAKER_00": "Jason Calacanis", "SPEAKER_01": "Unknown", "SPEAKER_09": "X"}, "notes": "ok"}\n```'
-    mapping, data = speakers.parse_mapping(reply, {"SPEAKER_00", "SPEAKER_01"})
+    reply = 'Sure:\n```json\n' + json.dumps({"speakers": [
+        {"label": "SPEAKER_00", "name": "Jason Calacanis", "confidence": "high"},
+        {"label": "SPEAKER_01", "name": "Unknown", "confidence": "low"},
+        {"label": "SPEAKER_09", "name": "X", "confidence": "low"},
+    ], "notes": "ok"}) + '\n```'
+    mapping, info = speakers.parse_mapping(reply, {"SPEAKER_00", "SPEAKER_01"})
     assert mapping == {"SPEAKER_00": "Jason Calacanis"}
-    assert data["notes"] == "ok"
+    assert info == {"confidence": {"SPEAKER_00": "high"}, "notes": "ok"}
 
 
 def test_prompt_contains_evidence():
@@ -210,6 +214,7 @@ class FakeClient:
         )
         create = lambda **kw: (setattr(self, "kwargs", kw), reply)[1]  # noqa: E731
         self.beta = SimpleNamespace(messages=SimpleNamespace(create=create))
+        self.messages = SimpleNamespace(create=create)
 
 
 def test_summarize_request_and_reply(tmp_path):
@@ -224,6 +229,43 @@ def test_summarize_request_and_reply(tmp_path):
     assert "[00:00:01] Chamath Palihapitiya: Thanks" in kw["messages"][0]["content"]
     with pytest.raises(RuntimeError, match="declined"):
         summary.summarize(ep, named, make_cfg(tmp_path, anthropic_api_key="k"), client=FakeClient(stop_reason="refusal"))
+
+
+def test_map_speakers_request_and_reply(tmp_path):
+    ep = parse_feed(FEED)[0]
+    turns = build_turns(SEGMENTS)
+    cfg = make_cfg(tmp_path, anthropic_api_key="k")
+    reply = {"speakers": [{"label": "SPEAKER_00", "name": "Jason Calacanis", "confidence": "high"},
+                          {"label": "SPEAKER_01", "name": "Chamath Palihapitiya", "confidence": "medium"}],
+             "notes": "Clear from the intro."}
+    client = FakeClient(json.dumps(reply))
+    info = speakers.map_speakers(ep, turns, cfg, client=client)
+    assert info["mapping"] == {"SPEAKER_00": "Jason Calacanis", "SPEAKER_01": "Chamath Palihapitiya"}
+    assert info["confidence"]["SPEAKER_01"] == "medium" and info["notes"] == "Clear from the intro."
+    assert client.kwargs["model"] == cfg.claude_model
+    assert client.kwargs["output_config"]["format"] == {"type": "json_schema", "schema": speakers.SCHEMA}
+    with pytest.raises(RuntimeError, match="declined"):
+        speakers.map_speakers(ep, turns, cfg, client=FakeClient(stop_reason="refusal"))
+    with pytest.raises(RuntimeError, match="max_tokens"):
+        speakers.map_speakers(ep, turns, cfg, client=FakeClient(stop_reason="max_tokens"))
+
+
+def test_speaker_naming_failure_still_writes_transcript(tmp_path, monkeypatch):
+    """A naming failure after hours of transcription must not lose the episode."""
+    ep = parse_feed(FEED)[0]
+    cfg = make_cfg(tmp_path, anthropic_api_key="k")
+    work = cfg.episodes_dir / ep.slug
+    work.mkdir(parents=True)
+    (work / "raw_whisperx.json").write_text(json.dumps({"segments": SEGMENTS}))
+
+    def broken(*a, **kw):
+        raise RuntimeError("Speaker mapping failed: Expecting ',' delimiter")
+
+    monkeypatch.setattr(speakers, "map_speakers", broken)
+    monkeypatch.setattr(summary, "summarize", lambda *a, **kw: {"takeaways": [], "model": None})
+    out = pipeline.process_episode(ep, cfg, send_email=False)
+    assert "Speaker 1: Welcome back Chamath." in out.read_text(encoding="utf-8")
+    assert not (work / "speakers.json").exists()  # not cached, so a rerun tries naming again
 
 
 def test_render_includes_takeaways(tmp_path):

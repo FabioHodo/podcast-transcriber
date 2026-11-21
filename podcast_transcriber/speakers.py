@@ -28,10 +28,32 @@ Rules:
   name is allowed.
 - A label with only a few words (ads, clips, crosstalk) may be "Unknown" if the evidence is thin.
 - Spell names correctly even if the transcript misspells them.
-- Respond with JSON only, no prose, in exactly this shape:
-  {"mapping": {"SPEAKER_00": "Full Name", ...},
-   "confidence": {"SPEAKER_00": "high|medium|low", ...},
-   "notes": "one short sentence on anything uncertain"}"""
+- Give one entry per diarization label: its label, the person's full name (or "Unknown"), and
+  your confidence. Put anything uncertain in "notes", in one short sentence."""
+
+# Enforced by the API (structured outputs), so the reply is always valid JSON. The labels are a
+# list rather than an object keyed by label because the schema can't allow arbitrary keys.
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "speakers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "name": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                },
+                "required": ["label", "name", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["speakers", "notes"],
+    "additionalProperties": False,
+}
 
 
 def _transcript_for_prompt(turns: list[Turn]) -> str:
@@ -62,50 +84,58 @@ def build_user_prompt(episode: Episode, turns: list[Turn], hosts: list[str]) -> 
 
 
 def parse_mapping(text: str, labels: set[str]) -> tuple[dict[str, str], dict]:
-    """Extract the JSON object from the model's reply; tolerate code fences / chatter."""
+    """Turn the model's JSON reply into {label: name}, dropping unknown labels and "Unknown" names.
+
+    Returns (mapping, info) where info holds "confidence" ({label: level}) and "notes".
+    """
     match = re.search(r"\{.*\}", text, flags=re.S)
     if not match:
         raise ValueError("No JSON object in model reply")
     data = json.loads(match.group(0))
-    raw = data.get("mapping") or {}
-    mapping = {
-        label: name.strip()
-        for label, name in raw.items()
-        if label in labels and isinstance(name, str) and name.strip()
-        and name.strip().lower() not in {"unknown", "unknown speaker", "n/a"}
-    }
-    return mapping, data
+    mapping: dict[str, str] = {}
+    confidence: dict[str, str] = {}
+    for item in data.get("speakers") or []:
+        if not isinstance(item, dict):
+            continue
+        label, name = item.get("label"), item.get("name")
+        if label not in labels or not isinstance(name, str):
+            continue
+        if name.strip() and name.strip().lower() not in {"unknown", "unknown speaker", "n/a"}:
+            mapping[label] = name.strip()
+            confidence[label] = item.get("confidence") or ""
+    return mapping, {"confidence": confidence, "notes": data.get("notes") or ""}
 
 
-def map_speakers(episode: Episode, turns: list[Turn], cfg: Config) -> dict:
+def map_speakers(episode: Episode, turns: list[Turn], cfg: Config, client=None) -> dict:
     """Return {"mapping": {...}, "confidence": {...}, "notes": str, "model": str}."""
     labels = {t.speaker for t in turns}
     if not cfg.anthropic_api_key:
         log.warning("ANTHROPIC_API_KEY not set: speakers will stay as 'Speaker N'")
         return {"mapping": {}, "confidence": {}, "notes": "No API key; speakers not named.", "model": None}
 
-    import anthropic
+    if client is None:
+        import anthropic
 
-    client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
+        client = anthropic.Anthropic(api_key=cfg.anthropic_api_key)
     prompt = build_user_prompt(episode, turns, cfg.hosts)
     last_error: Exception | None = None
     for attempt in range(2):
         resp = client.messages.create(
             model=cfg.claude_model,
-            max_tokens=1024,
+            max_tokens=4096,  # thinking counts toward this too; the JSON itself is small
+            output_config={"format": {"type": "json_schema", "schema": SCHEMA}},
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
         reply = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text")
         try:
-            mapping, data = parse_mapping(reply, labels)
+            if resp.stop_reason == "refusal":
+                raise ValueError(f"request was declined: {resp.stop_details}")
+            if resp.stop_reason == "max_tokens":
+                raise ValueError("reply was cut off at max_tokens")
+            mapping, info = parse_mapping(reply, labels)
             log.info("Speaker mapping: %s", mapping)
-            return {
-                "mapping": mapping,
-                "confidence": data.get("confidence") or {},
-                "notes": data.get("notes") or "",
-                "model": cfg.claude_model,
-            }
+            return {**info, "mapping": mapping, "model": cfg.claude_model}
         except (ValueError, json.JSONDecodeError) as exc:
             last_error = exc
             log.warning("Could not parse mapping (attempt %d): %s", attempt + 1, exc)
